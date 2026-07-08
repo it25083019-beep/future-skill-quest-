@@ -1,0 +1,463 @@
+TASK
+# タスク計画（MVP完成に必要な範囲）
+
+## A) 担当者1 – バックエンド / API担当
+
+* FastAPIプロジェクトの基盤構築（環境設定、ログ管理、エラーハンドリング）
+* 以下のAPI実装
+
+  * `POST /chat`
+  * `POST /checkin/morning`
+  * `POST /checkin/evening`
+  * `GET /state/{user_id}`
+* データベース設計（SQLite / PostgreSQL）
+
+  * `users`
+  * `user_state`
+  * `chat_logs`
+  * `exp_logs`
+* シンプルな認証機能の実装（開発用トークンまたは`user_id`バリデーション）
+* UIチーム向けのSwaggerドキュメントおよびPostmanコレクションの作成
+* ステージング環境へのデプロイ（Render / Railway）
+
+---
+
+## B) 担当者2 – AI / Luna担当
+
+* 本番環境向けSystem Promptの整備（ペルソナ・安全性・出力フォーマット）
+* `<dialogue>` と `<game_state_json>` の安定したパーサー実装
+* モデルのリトライ処理・フォールバック・タイムアウト処理の実装
+* メモリ管理ロジックの実装
+
+  * 条件を満たした場合のみ `memory_note` を保存
+  * 重複や不要なデータを保存しない
+* EXP付与ルール・レベル計算式・1日あたりの獲得上限の実装
+* 会話テストケース（20～30ケース）の作成
+
+---
+
+## 共通タスク（2人で対応）
+
+* UIチームとのAPI仕様（リクエスト／レスポンス）の確定
+* State Schemaの確定
+
+  * 必須キー
+  * 任意キー（Optional）
+* エンドツーエンド（E2E）テスト
+
+  * Chat → State更新 → UIが正しくStateを取得できることを確認
+* リリースチェックリストおよび60～90秒のデモシナリオの作成
+
+
+
+
+
+
+# とても良いです。それでは、1ステップずつ非常に詳しく進めていきます。
+
+以下の手順を順番どおりに実行するだけで大丈夫です。
+マニュアルのようなイメージで進めてください。
+
+---
+
+# パートA — DEV-A（バックエンド担当）
+
+## 目標
+
+**本日中にローカル環境で4つのAPIを動作させること。**
+
+---
+
+# ステップ1 — プロジェクトフォルダを作成
+
+### 作業内容
+
+ターミナルを開き、以下を実行します。
+
+```bash
+mkdir fsq-backend
+cd fsq-backend
+```
+
+### 期待される結果
+
+現在のディレクトリが **fsq-backend** になっていること。
+
+---
+
+# ステップ2 — Python仮想環境を作成
+
+```bash
+python -m venv .venv
+```
+
+### 仮想環境を有効化
+
+#### Windows
+
+```bash
+.venv\Scripts\activate
+```
+
+#### Mac / Linux
+
+```bash
+source .venv/bin/activate
+```
+
+### 期待される結果
+
+ターミナルの先頭に
+
+```
+(.venv)
+```
+
+と表示されていること。
+
+---
+
+# ステップ3 — 必要なライブラリをインストール
+
+```bash
+pip install fastapi uvicorn pydantic python-dotenv google-genai
+```
+
+### インストール確認
+
+```bash
+pip list
+```
+
+以下のライブラリが表示されることを確認してください。
+
+* fastapi
+* uvicorn
+* google-genai
+
+---
+
+# ステップ4 — ファイルを作成
+
+以下の6つのファイルを作成します。
+
+* main.py
+* schemas.py
+* store.py
+* exp_engine.py
+* luna_service.py
+* .env
+
+---
+
+# ステップ5 — .env を設定
+
+`.env` を開き、以下を貼り付けます。
+
+```env
+GOOGLE_API_KEY=あなたの新しいAPIキー
+MODEL_NAME=gemini-2.5-flash
+```
+
+### 注意
+
+APIキーは**有効な新しいキー**を使用してください。
+
+---
+
+# ステップ6 — schemas.py を作成
+
+以下のコードを `schemas.py` に貼り付けます。
+
+```python
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+
+class CheckinRequest(BaseModel):
+    user_id: str
+    goal: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    dialogue: str
+    game_state: Dict[str, Any]
+```
+
+---
+
+# ステップ7 — store.py を作成
+
+以下のコードを `store.py` に貼り付けます。
+
+```python
+from typing import Dict, Any
+DB: Dict[str, Dict[str, Any]] = {}
+
+def get_user_state(user_id: str) -> Dict[str, Any]:
+    if user_id not in DB:
+        DB[user_id] = {
+            "user_id": user_id,
+            "current_level": 1,
+            "total_exp": 0,
+            "daily_exp": 0,
+            "streak": 0,
+            "chat_history": [],
+            "trained_knowledge": []
+        }
+    return DB[user_id]
+
+def save_user_state(user_id: str, state: Dict[str, Any]):
+    DB[user_id] = state
+```
+
+---
+
+# ステップ8 — exp_engine.py を作成
+
+以下のコードを `exp_engine.py` に貼り付けます。
+
+```python
+import math
+
+ACTION_EXP = {
+    "morning_checkin": 8,
+    "evening_checkin": 12
+}
+DAILY_CAP = 140
+
+def add_exp(state: dict, action: str):
+    gain = ACTION_EXP.get(action, 0)
+    remain = max(0, DAILY_CAP - state.get("daily_exp", 0))
+    gain = min(gain, remain)
+    state["daily_exp"] = state.get("daily_exp", 0) + gain
+    state["total_exp"] = state.get("total_exp", 0) + gain
+    state["current_level"] = int(math.floor(1 + math.sqrt(state["total_exp"] / 100)))
+    return gain, state
+```
+
+---
+
+# ステップ9 — luna_service.py を作成
+
+以下のコードを `luna_service.py` に貼り付けます。
+
+```python
+import os, json, time, random
+from dotenv import load_dotenv
+from google import genai
+
+load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+
+if not GOOGLE_API_KEY:
+    raise ValueError("Missing GOOGLE_API_KEY in .env")
+
+client = genai.Client(api_key=GOOGLE_API_KEY)
+
+SYSTEM_PROMPT = """
+You are Luna. Output strictly in 2 blocks: <dialogue> and <game_state_json>.
+"""
+
+def generate_with_retry(user_text: str, max_retries=5):
+    models = [MODEL_NAME, "gemini-2.0-flash"]
+    last_error = None
+    for m in models:
+        for i in range(max_retries):
+            try:
+                r = client.models.generate_content(
+                    model=m,
+                    contents=user_text,
+                    config={"system_instruction": SYSTEM_PROMPT}
+                )
+                return r.text or ""
+            except Exception as e:
+                last_error = e
+                msg = str(e)
+                if any(x in msg for x in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                    time.sleep(min(2**i, 20) + random.random())
+                    continue
+                raise
+    raise RuntimeError(f"Model unavailable: {last_error}")
+
+def parse_ai_reply(text: str):
+    dialogue = text
+    game_state = {}
+    if "<dialogue>" in text and "</dialogue>" in text:
+        dialogue = text.split("<dialogue>")[1].split("</dialogue>")[0].strip()
+    if "<game_state_json>" in text and "</game_state_json>" in text:
+        raw = text.split("<game_state_json>")[1].split("</game_state_json>")[0].strip()
+        try:
+            game_state = json.loads(raw)
+        except:
+            game_state = {}
+    return dialogue, game_state
+```
+
+---
+
+# ステップ10 — main.py を作成
+
+以下のコードを `main.py` に貼り付けます。
+
+```python
+from fastapi import FastAPI, HTTPException
+from schemas import ChatRequest, CheckinRequest
+from store import get_user_state, save_user_state
+from exp_engine import add_exp
+from luna_service import generate_with_retry, parse_ai_reply
+
+app = FastAPI(title="FSQ Luna Backend")
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/state/{user_id}")
+def get_state(user_id: str):
+    return get_user_state(user_id)
+
+@app.post("/checkin/morning")
+def morning_checkin(req: CheckinRequest):
+    state = get_user_state(req.user_id)
+    gain, state = add_exp(state, "morning_checkin")
+    state["last_morning_goal"] = req.goal
+    save_user_state(req.user_id, state)
+    return {"message": "Morning saved", "exp_gain": gain, "state": state}
+
+@app.post("/checkin/evening")
+def evening_checkin(req: CheckinRequest):
+    state = get_user_state(req.user_id)
+    gain, state = add_exp(state, "evening_checkin")
+    save_user_state(req.user_id, state)
+    return {"message": "Evening saved", "exp_gain": gain, "state": state}
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    state = get_user_state(req.user_id)
+    try:
+        raw = generate_with_retry(req.message)
+        dialogue, ai_state = parse_ai_reply(raw)
+
+        if isinstance(ai_state, dict):
+            for k in ["current_focus", "current_plan", "current_do_now", "memory_note"]:
+                if k in ai_state:
+                    state[k] = ai_state[k]
+
+        state["chat_history"].append({"role": "user", "content": req.message})
+        state["chat_history"].append({"role": "assistant", "content": dialogue})
+        save_user_state(req.user_id, state)
+
+        return {"dialogue": dialogue, "game_state": state}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+```
+
+---
+
+# ステップ11 — サーバーを起動
+
+以下を実行します。
+
+```bash
+uvicorn main:app --reload
+```
+
+### 期待される結果
+
+以下のようなメッセージが表示されます。
+
+```
+Uvicorn running on http://127.0.0.1:8000
+```
+
+---
+
+# ステップ12 — SwaggerでAPIをテスト
+
+ブラウザで以下を開きます。
+
+```
+http://127.0.0.1:8000/docs
+```
+
+---
+
+## テスト1：/health
+
+* 「Try it out」をクリック
+* 「Execute」をクリック
+
+期待される結果
+
+```json
+{"ok": true}
+```
+
+---
+
+## テスト2：/state/{user_id}
+
+```
+user_id = u1
+```
+
+期待される結果
+
+初期状態（デフォルト）のStateが返ってくること。
+
+---
+
+## テスト3：/checkin/morning
+
+リクエストBody
+
+```json
+{
+  "user_id": "u1",
+  "goal": "2ポモドーロ勉強する"
+}
+```
+
+期待される結果
+
+```
+exp_gain: 8
+```
+
+が返ること。
+
+---
+
+## テスト4：/chat
+
+リクエストBody
+
+```json
+{
+  "user_id": "u1",
+  "message": "今夜の勉強計画を立てて"
+}
+```
+
+期待される結果
+
+* `dialogue`
+* `game_state`
+
+が返ってくること。
+
+---
+
+## テスト5：/state/u1
+
+最後に
+
+```
+GET /state/u1
+```
+
+を実行し、`chat_history` に会話履歴が保存されていることを確認してください。
